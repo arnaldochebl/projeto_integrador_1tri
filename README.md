@@ -1,0 +1,4 @@
+Projeto do primeiro trimestre da pós-graduação em Data Science e Decisão pela Insper.
+Utilizamos os melhores modelos de machine learning para prever se a empresa vai fechar nos próximos 2 anos e comparamos cada um deles atráves das melhores medidas de desempenho para classificação.
+
+O arquivo HTML contém o relatório com nossas análises e conclusão.
