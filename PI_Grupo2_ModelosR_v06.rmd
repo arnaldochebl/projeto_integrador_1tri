@@ -1,0 +1,727 @@
+---
+title: "Projeto Integrador"
+author: "Grupo 2 - Arnaldo, Daniel, Giovanna, Caetano"
+date: "2023-09-11"
+output: html_document
+encoding: UTF-8
+---
+
+# 1. Descrição do problema e análise das métricas de desempenho
+
+Esta etapa do projeto tem como objetivo desenvolver modelos de classificação para determinar se uma empresa encerrará suas atividades em até dois anos. Os dados usados foram coletados pela Bisnode, uma empresa europeia especializada em informações empresariais, e pré-processados pelo nosso grupo em python.
+
+Foi utilizado os modelos de Regressão Logística, Ridge, Lasso, Elastic-net, Random Forest e XGBOOST para realizar a modelagem de classificação das empresas. 
+
+Decidimos utilizar a AUC-ROC para medir e comparar a performance dos modelos dado sua capacidade de equilibrar sensibilidade e especificidade, resistir ao desbalanceamento de classes e proporcionar uma interpretação intuitiva da capacidade do modelo, tornando-a uma métrica abrangente e facilmente compreensível.
+
+Após a escolha final do modelo, rodamos também uma matriz de confusão do modelo escolhido para diferentes thresholds, de forma a avaliar diferentes métricas como acuracidade total,  Sensibilidade, Especificidade, Valores Preditos Positivos (PPV) e Valores Preditos Negativos (NPV) de forma a possibilitar a definição final do threshold do modelo que melhor atingiria os possíveis objetivos de negócio ao se implementar este modelo. 
+
+
+
+## Setup e Biblioteca
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache= TRUE , warning = FALSE, message=FALSE)
+options(digits = 4) 
+
+```
+
+```{r Bibliotecas,message=FALSE, include=FALSE}
+library(ISLR2)
+library(naniar)
+library(ranger)
+library(rpart)
+library(rpart.plot)
+library(partykit)
+library(GGally)
+library(vip)
+library(tidymodels)
+library(DescTools)
+library(MASS)
+library(glue) 
+library(gapminder) 
+library(ISLR) 
+library(glmnet)
+library(plotmo)
+library(readxl) 
+library(rmarkdown)
+library(devtools)
+library(tidyverse)
+library(skimr)
+library(patchwork)
+library(rsample)
+library(FNN)
+library(yardstick)
+library(pROC)
+library(pdp)
+library(gbm)
+library(xgboost)
+library(cowplot)
+```
+
+# 2. Input da Base e ajustes básicos
+```{r Input,message=FALSE}
+
+df <- read.csv("C:/Users/arnch/OneDrive/Documentos/Insper/projeto_integrador/base_modelo_v03.csv")
+df %>% head(5)  %>% glimpse()
+
+#view(df)
+```
+
+
+```{r Ajustes para modelagem em R, include=FALSE}
+# transformação para fator das variáveis categoricas
+  # colunas texto
+df <- df %>% 
+  mutate_if(is.character, ~as.factor(.x))
+
+  # demais colunas
+colunas_para_fator <- c("gender_ajust", "origin_ajust", "nace_main_ajust", "ind2_ajust", "ind_ajust", "urban_m_ajust", "region_m_ajust", "flag", "birth_year_flag", "labor_avg_flag")
+
+
+for (col in colunas_para_fator) {
+  df[[col]] <- as.factor(df[[col]])
+}
+
+
+```
+
+```{r Descritiva da Base, include=FALSE}
+
+skim(df)
+
+```
+
+### Visualização da variável objetivo
+```{r, echo = FALSE}
+
+
+df %>% 
+  group_by(flag) %>%
+  summarize(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100) %>% 
+  ggplot(aes(x=flag, y=count, fill=flag))+
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(count, " (", round(percentage, 2), "%)")), vjust = -0.5, size=4) +
+  labs(
+    x = "Flag",
+    y = "Participação na base",
+    title = "Frequência da variável objetivo"
+  ) +
+  theme()+
+  ylim(0, 20000)+
+  scale_fill_discrete() 
+
+
+
+```
+
+Apenas 3.37% das empresas da base, no ano de 2012, estão com o flag para indicar que irão encerrar suas operações nos próximos 2 anos.
+
+
+
+# 3. Split da base em treino e teste
+Iremos separar a base em treino e teste, mantendo a proporção da variável resposta (flag).
+Adicionalmente, faremos as transformações destas bases para input nos modelos glmnet e xgboost
+```{r Split Treino e teste}
+
+#split inicial da base em 80% para treino
+set.seed(123)
+splits <- initial_split(df, prop = .8, strata = 'flag')
+tr   <- training(splits)
+test <- testing(splits)
+
+# Transformação em matrix para glmnet
+X_tr <- model.matrix(flag ~ ., tr)[,-1] 
+y_tr <- tr$flag
+X_test <- model.matrix(flag ~ ., test)[,-1]
+y_test <- test$flag
+
+# Transformação para matrix XGBM
+tr_XGBM <- tr
+test_XGBM <- test
+tr_XGBM$flag <- ifelse(tr_XGBM$flag == "1", 1, 0)
+test_XGBM$flag <- ifelse(test_XGBM$flag == "1", 1, 0)
+
+```
+
+
+# 4. Criação do Tibble de Comparativo de Desempenho
+Agora iremos criar um tibble para armazenar os resultados dos modelos
+```{r Criação da Tabela de Resultados}
+desempenho <- tibble(
+  prob = numeric(0),                 # número decimal
+  classes = factor(character(0)),    # fator
+  metodo = factor(character(0))      # fator
+)
+```
+
+# 5. Modelos
+
+- Foram selecionados algumas classes de modelos para realizarmos a classificação dos dados:
+  1) Regressão Logistica
+  2) Modelos Regularizados (Ridge, LASSO, Elastic-Net)
+  3) Random Forest - ranger
+  4) Extreme Gradient Boosting - XGBoost
+
+
+## 5.1 Regressão Logística
+
+```{r}
+
+# Fit do modelo logístico 
+logistic_model2 <- glm(flag ~ ., data = tr, family = "binomial")
+
+
+# Predições do modelo logístico
+predictions_LM2 <- as.vector(predict(logistic_model2, newdata = test, type = "response"))
+
+# Salvando vetor de previsões no tibble desempenho
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = predictions_LM2, 
+                   classes = ifelse(y_test == "1", "Yes", "No"), 
+                   metodo = "Reg_Log"))
+
+# Calculo do AUC
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+# Construção da curva ROC
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+
+#visualizando os coeficientes e a regressão
+#summary(logistic_model2)
+
+```
+
+## 5.2 Modelos Regularizados
+
+### Ridge
+```{r}
+set.seed(123)
+fit <- glmnet(X_tr,y_tr, family='binomial',alpha = 0)
+#plot_glmnet(fit)
+
+cv_ridge <- cv.glmnet(X_tr, y_tr, alpha = 0, family = "binomial")
+plot(cv_ridge)
+
+s <- cv_ridge$lambda.1se
+
+prob_ridge <- as.vector(predict(fit, newx = X_test, type = "response", s = s))
+
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = prob_ridge, 
+                     classes = ifelse(test$flag == "1", "Yes", "No"), 
+                     metodo = "Ridge"))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+```
+
+### LASSO
+```{r}
+set.seed(123)
+fit <- glmnet(X_tr,y_tr, family='binomial',alpha = 1)
+
+cv_lasso <- cv.glmnet(X_tr, y_tr, alpha = 1, family = "binomial")
+plot(cv_lasso)
+
+s <- cv_lasso$lambda.1se
+
+#plota gráfico do lambda em função do peso dos coeficientes das produtoras e marca lambda que utilizamos
+plot_glmnet(fit, s=s)
+
+prob_lasso <- as.vector(predict(fit, newx = X_test, type = "response", s = s))
+
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = prob_lasso, 
+                     classes = ifelse(test$flag == "1", "Yes", "No"), 
+                     metodo = "Lasso"))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+```
+
+### Elastic-Net
+
+## Otimização de hiperparâmetro: alpha e lambda
+```{r hiperparametros_elastic, eval=FALSE}
+set.seed(123)
+
+values <- seq(0, 1, 0.05)
+avaliacao <- tibble(alpha = values,
+                    s = NA_real_,
+                    measure = NA_real_)
+
+#descobre melhor lambda para cada valor de alpha
+for (val in values) {
+  set.seed(123)
+  cv_elastic <- cv.glmnet(X_tr,y_tr, family='binomial', alpha = val)
+  avaliacao$s[avaliacao$alpha==val]  <- cv_elastic$lambda.1se
+
+    # Encontrar o índice correspondente a lambda.1se
+  index_1se <- which(cv_elastic$lambda == cv_elastic$lambda.1se)
+
+  # Obter o valor da medida para lambda.1se
+  avaliacao$measure[avaliacao$alpha==val] <- cv_elastic$cvm[index_1se]
+}
+
+avaliacao  %>% 
+  ggplot(aes(alpha, measure)) +
+  geom_point() +
+  geom_line()
+
+# Encontre a linha do dataframe onde measure é mínimo
+min_row <- avaliacao[which.min(avaliacao$measure), ]
+
+# Extraia os valores de alpha e s
+alpha <- min_row$alpha
+s <- min_row$s
+```
+
+# realiza o modelo com os melhores hiperparametros, faz a previsão e computa o EQM
+```{r}
+#obtem melhor alpha **de acordo com validação cruzada**
+alpha <- 0.85
+s <- 0.004982
+set.seed(123)
+fit <- glmnet(X_tr,y_tr, family='binomial',alpha = alpha)
+prob_elastic <- as.vector(predict(fit, newx = X_test, type = "response", s = s))
+
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = prob_elastic, 
+                     classes = ifelse(test$flag == "1", "Yes", "No"), 
+                     metodo = "Elastic-Net"))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+```
+
+
+### 5.3 Random Forest
+
+Faremos primeiro os ajustes individuais dos hiperparâmetros abaixo: <br>
+- num.trees: quantidade de árvores da floresta <br>
+- mtry: quantidade de colunas selecionadas em cada sorteio para avaliar quebra da arvore <br>
+- min.node.size: a quantidade mínima de observações para ter novo split <br>
+- max.depth: profundidade máxima das arvores da floresta <br>
+
+
+```{r ajuste num.trees, eval = FALSE}
+set.seed(123)
+ajusta_hp <- function(split, num.trees) {
+  set.seed(123)
+  tr <- training(split)
+  test <- testing(split)
+  
+  fit <- ranger(flag ~ ., num.trees = num.trees, data = tr, classification = TRUE, probability = TRUE, num.threads = 8)
+
+  prob_rf <- predict(fit, test)$predictions[,2] #retorna probabilidade
+  
+  auc <- tibble(prob = prob_rf, 
+                classes = ifelse(test$flag == "1", "Yes", "No"),
+                metodo = "RF")  %>%
+    mutate(classes = factor(classes)) %>% 
+    group_by(metodo) %>% 
+    roc_auc(classes, prob, event_level = "second") %>% 
+    pull(.estimate) %>%
+    as.numeric()
+  
+  return(auc)
+}
+
+
+avaliacao <- crossing(rsample::vfold_cv(tr, v = 5), 
+                      num.trees = c(seq(100,1500, 100)))
+                        
+avaliacao %>% 
+  mutate(auc = map2_dbl(splits, num.trees, ajusta_hp)) %>% 
+  group_by(num.trees) %>% 
+  summarise(auc = mean(auc))  %>%
+  ggplot(aes(num.trees, auc)) +
+  geom_point() +
+  geom_line() #quanto maior melhor
+
+# melhor num.trees = 500
+```
+
+
+ajuste mtry
+```{r ajuste mtry, eval = FALSE}
+set.seed(123)
+ajusta_hp <- function(split, mtry) {
+  set.seed(123)
+  tr <- training(split)
+  test <- testing(split)
+  
+  fit <- ranger(flag ~ ., num.trees = 500, mtry = mtry, data = tr, classification = TRUE, probability = TRUE, num.threads = 8)
+
+  prob_rf <- predict(fit, test)$predictions[,2] #retorna probabilidade
+  
+  auc <- tibble(prob = prob_rf, 
+                classes = ifelse(test$flag == "1", "Yes", "No"),
+                metodo = "RF")  %>%
+    mutate(classes = factor(classes)) %>% 
+    group_by(metodo) %>% 
+    roc_auc(classes, prob, event_level = "second") %>% 
+    pull(.estimate) %>%
+    as.numeric()
+  
+  return(auc)
+}
+
+
+avaliacao <- crossing(rsample::vfold_cv(tr, v = 5), 
+                      mtry = seq(1,10))
+                        
+avaliacao %>% 
+  mutate(auc = map2_dbl(splits, mtry, ajusta_hp)) %>% 
+  group_by(mtry) %>% 
+  summarise(auc = mean(auc))  %>%
+  ggplot(aes(mtry, auc)) +
+  geom_point() +
+  geom_line() #quanto maior melhor
+
+# melhor mtry = 3
+```
+
+ajuste min.node.size
+```{r min.node.size, eval = FALSE}
+set.seed(123)
+ajusta_hp <- function(split, min.node.size) {
+  set.seed(123)
+  tr <- training(split)
+  test <- testing(split)
+  
+  fit <- ranger(flag ~ ., num.trees = 500, mtry = 3, min.node.size = min.node.size, data = tr, classification = TRUE, probability = TRUE, num.threads = 8)
+
+  prob_rf <- predict(fit, test)$predictions[,2] #retorna probabilidade
+  
+  auc <- tibble(prob = prob_rf, 
+                classes = ifelse(test$flag == "1", "Yes", "No"),
+                metodo = "RF")  %>%
+    mutate(classes = factor(classes)) %>% 
+    group_by(metodo) %>% 
+    roc_auc(classes, prob, event_level = "second") %>% 
+    pull(.estimate) %>%
+    as.numeric()
+  
+  return(auc)
+}
+
+
+avaliacao <- crossing(rsample::vfold_cv(tr, v = 5), 
+                      min.node.size = c(1:9, seq(10,100, 10)))
+                        
+avaliacao %>% 
+  mutate(auc = map2_dbl(splits, min.node.size, ajusta_hp)) %>% 
+  group_by(min.node.size) %>% 
+  summarise(auc = mean(auc))  %>%
+  ggplot(aes(min.node.size, auc)) +
+  geom_point() +
+  geom_line() #quanto maior melhor
+
+# melhor min.node.size = 70
+```
+
+ajuste max.depth
+```{r max.depth, eval = FALSE}
+set.seed(123)
+ajusta_hp <- function(split, max.depth) {
+  set.seed(123)
+  tr <- training(split)
+  test <- testing(split)
+  
+  fit <- ranger(flag ~ ., num.trees = 500, mtry = 3, min.node.size = 70, max.depth = max.depth, data = tr, classification = TRUE, probability = TRUE, num.threads = 8)
+
+  prob_rf <- predict(fit, test)$predictions[,2] #retorna probabilidade
+  
+  auc <- tibble(prob = prob_rf, 
+                classes = ifelse(test$flag == "1", "Yes", "No"),
+                metodo = "RF")  %>%
+    mutate(classes = factor(classes)) %>% 
+    group_by(metodo) %>% 
+    roc_auc(classes, prob, event_level = "second") %>% 
+    pull(.estimate) %>%
+    as.numeric()
+  
+  return(auc)
+}
+
+
+avaliacao <- crossing(rsample::vfold_cv(tr, v = 5), 
+                      max.depth = seq(1,46,3))
+                        
+avaliacao %>% 
+  mutate(auc = map2_dbl(splits, max.depth, ajusta_hp)) %>% 
+  group_by(max.depth) %>% 
+  summarise(auc = mean(auc))  %>%
+  ggplot(aes(max.depth, auc)) +
+  geom_point() +
+  geom_line() #quanto maior melhor
+
+# melhor max.depth = 15
+
+```
+
+Resultados da otimização de Hiperparâmetros <br>
+num.trees = 500 <br>
+mtry = 3 <br>
+min.node.size = 70 <br>
+max.depth = 15 <br>
+
+
+#### Modelo Random Forest com hiperparâmtros otimizados
+
+```{r Resultados Random forest}
+set.seed(123) 
+(rf <- ranger(flag ~ ., num.trees = 500, mtry = 3, min.node.size = 70, max.depth = 15, data = tr, classification = TRUE, probability = TRUE, num.threads = 8))
+prob_rf <- predict(rf, test)$predictions[,2] #retorna probabilidade
+
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = prob_rf, 
+                     classes = ifelse(test$flag == "1", "Yes", "No"), 
+                     metodo = "RF"))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+
+
+# Importancia das variaveis para o modelo utilizando o método de permutation
+set.seed(123)
+rf1 <- ranger(flag ~ ., num.trees = 500, mtry = 3, min.node.size = 70, max.depth = 15, data = tr, classification = TRUE, probability = TRUE, num.threads = 8, importance = "permutation")
+vip::vip(rf1, aesthetics = list(fill = "lightblue"))
+
+
+
+
+```
+
+
+### 5.4 XGBoost - Extreme Gradient Boosting Model
+
+Primeiro faremos um gridsearch para otimizar o conjunto de hiperparâmetros do modelo. hiperparâmetros otimizados: <br>
+
+eta: controle da taxa de aprendizado do modelo ou lambda; <br>
+Nrounds: quantidade de árvores colocadas em série; <br>
+Subsample: percentual do total de observações sorteadas disponíveis para treinar cada árvore; <br>
+Colsample_bytree: percentual do total de colunas sorteadas para treinar cada árvore; <br>
+
+
+```{r otimização hiperparâmetros, eval=FALSE}
+
+start_time <- Sys.time()
+set.seed(123)
+hiperparametros <- crossing(eta = c(.0075, .01, .025, .05, .075), 
+                            nrounds = c(500, 750, 1000, 1500), 
+                            max_depth = c(1, 2, 4),
+                            subsample = c(.2, .4, .6, .8), #seleção de parte das observaçoes
+                            colsample_bytree = c(.2, .4, 0.6, .8)) #seleção de parte das variáveis
+
+
+ajusta_bst <- function(splits, eta, nrounds, max_depth, subsample, colsample_bytree) {
+  set.seed(123)
+  tr <- training(splits)
+  test <- testing(splits)
+
+  d_tr <- xgb.DMatrix(label = tr$flag, 
+                      data = model.matrix(flag ~ ., tr)[,-1])
+
+  fit <- xgb.train(data = d_tr, nrounds = nrounds, max_depth = max_depth, eta = eta, subsample= subsample,
+                   colsample_bytree = colsample_bytree, nthread = 24, verbose = FALSE, objective = "binary:logistic")
+
+
+  #faz obj matriz de teste
+  d_test <- xgb.DMatrix(label = test$flag, #tem que ser numero
+                      data = model.matrix(flag ~ ., test)[,-1])
+
+  #gera vetor com prob das previsões
+  pred_xgb <- predict(fit, d_test)
+
+  auc <- tibble(prob = pred_xgb, 
+                classes = ifelse(test$flag == "1", "Yes", "No"),
+                metodo = "XGBM")  %>%
+    mutate(classes = factor(classes)) %>% 
+    group_by(metodo) %>% 
+    roc_auc(classes, prob, event_level = "second") %>% 
+    pull(.estimate) %>%
+    as.numeric()
+
+  return(auc)
+}
+
+resultados <- rsample::vfold_cv(tr_XGBM, 5) %>% 
+  crossing(hiperparametros) %>% 
+  mutate(auc = pmap_dbl(list(splits, eta, nrounds, max_depth, subsample, colsample_bytree), ajusta_bst))
+  
+HP_XGBP <- resultados %>% 
+  group_by(eta, nrounds, max_depth, subsample, colsample_bytree) %>% 
+  summarise(auc = mean(auc)) %>% 
+  arrange(desc(auc)) 
+
+write_csv(HP_XGBP,'HP_XGBP_3.csv')
+
+end_time <- Sys.time()
+print(end_time - start_time) #4.1h
+```
+
+
+#### Resultados da otimização de Hiperparâmetros
+```{r Resultados otimização Hiperparâmetros}
+
+HP_XGBP <- read.csv("C:/Users/arnch/OneDrive/Documentos/Insper/projeto_integrador/HP_XGBP_3.csv")
+HP_XGBP %>% 
+  arrange(desc(auc)) %>% 
+  head()
+
+```
+Melhor conjunto: <br>
+eta = 0.01  <br>
+nrounds = 750 <br>
+max_depth = 4 <br>
+subsample = 0.6 <br>
+colsample_bytree = 0.4 <br>
+
+
+#### Previsão XGBM com hiperparâmetros otimizados
+```{r Resultados XGBoost}
+
+
+d_tr <- xgb.DMatrix(label =  ifelse(tr$flag == "1", 1, 0), 
+                    data = model.matrix(flag ~ ., tr)[,-1]) 
+
+fit_XGBM <- xgboost(data = d_tr, nrounds = 750, max_depth = 4, 
+                      eta = 0.01, subsample = 0.6, colsample_bytree = 0.4, nthread = 10, verbose = FALSE,
+                      objective="binary:logistic")
+
+# erro de teste 
+# faz o objeto matriz de teste
+d_test <- xgb.DMatrix(label = ifelse(test$flag == "1", 1, 0),
+                      data = model.matrix(flag ~ ., test)[,-1]) #predição
+
+pred_xgb <- predict(fit_XGBM, d_test)
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_xgb, 
+                                classes = ifelse(test$flag == "1", "Yes", "No"), 
+                                metodo = "XGBM"))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+
+#printa importancia relativa das preditoras - gráfico top15 preditoras
+importancia <- xgb.importance(model = fit_XGBM) #legal
+importancia_sorted <- importancia %>% 
+  arrange(desc(Gain)) %>% 
+  head(15)
+xgb.plot.importance(importancia_sorted, rel_to_first = TRUE, xlab = "Relative Importance")
+
+
+```
+
+```{r, include=FALSE, eval=FALSE}
+#printa importancia relativa das preditoras - gráfico full
+importancia <- xgb.importance(model = fit_XGBM) #legal
+xgb.plot.importance(importancia, rel_to_first = TRUE, xlab = "Relative Importance")
+
+```
+
+
+# 5. Resultados Finais 
+
+## Valores de AUC por modelo e curva ROC
+O melhor modelo para realizar as classificações foi o modelo XGBoost, perante a métrica AUC
+
+```{r Resultados Finais,  echo = FALSE }
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+
+```
+
+
+## Outras métricas de performance
+Após a escolha final do modelo XGBoost, rodamos também uma matriz de confusão para diferentes thresholds, de forma a avaliar diferentes métricas como acuracidade total,  Sensibilidade, Especificidade, Valores Preditos Positivos (PPV) e Valores Preditos Negativos (NPV) de forma a possibilitar a definição final do threshold do modelo que melhor atenderia os possíveis objetivos de negócio ao se implementar este modelo. 
+
+```{r}
+coords(roc(y_test, pred_xgb), c(.05,.1,.2,.3,.4,.5,.6,.7,.8,.9),
+       ret = c("threshold","accuracy", "sensitivity", "1-specificity", "ppv", "npv"))
+```
+
+
+## Comparativo da importancia das variáveis de modelos selecionados
+
+agora colocaremos abaixo a importancia relativa de alguns modelos, para compararmos mais facilmente as diferenças de escolha das variáveis. 
+
+XGBoost
+```{r,  echo = FALSE}
+#xgBoost
+xgb.plot.importance(importancia_sorted, rel_to_first = TRUE, xlab = "Relative Importance")
+
+```
+
+Random Forest
+```{r,  echo = FALSE}
+#Random Forest
+vip::vip(rf1, aesthetics = list(fill = "lightblue"))
+```
